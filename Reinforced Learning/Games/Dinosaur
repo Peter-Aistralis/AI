@@ -1,1 +1,1700 @@
+import os
+import time
+import random
+import pickle
+import glob
+from collections import deque
 
+import cv2
+import mss
+import numpy as np
+import matplotlib.pyplot as plt
+from pynput.keyboard import Controller, Key
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+from gym import Env
+from gym.spaces import Box, Discrete
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+LATEST_MODEL = "base_model.pth"
+BEST_MODEL = "base_model_best.pth"
+
+INPUT_SHAPE = (4, 60, 100)
+ACTION_SIZE = 3
+NUMBER_STEPS = 0
+# DQN
+BATCH_SIZE = 64
+GAMMA = 0.99
+LEARNING_RATE = 1e-4#1e-5
+GRAD_CLIP = 10.0
+# Exploration
+# IMPORTANT: epsilon is decayed by TRAINING STEP, not episode.
+EPSILON_START = 0.1
+EPSILON_MIN = 0.01
+EPSILON_DECAY_STEPS = 50_000
+EXPLORATION_REDUCE_THRESHOLD = 350
+EPSILON_CONTINUE = 0.15#0.05
+EXPLORATION_GRACE_STEPS = 50#170
+
+UPDATE_EVERY = 4  # only gradient-step every 4th environment step
+# Replay
+REPLAY_MEMORY_SIZE = 100_000
+LEARNING_STARTS = 5_000
+
+# Target network
+# Updated by actual gradient-training steps.
+TARGET_UPDATE_STEPS = 5_000
+
+# Environment
+MAX_STEPS = 10_000#5_000
+
+# 0.08 sec makes DUCK visible/meaningful while still
+# allowing reasonably fine-grained control.
+STEP_TIME = 0.08
+
+# Evaluation
+EVALUATION_EVERY_EPISODES = 250
+EVALUATION_GAMES = 20
+
+# Reward
+SURVIVAL_REWARD = 1.0
+DEATH_PENALTY = -50.0
+
+MILESTONES = [
+    100, 200, 300, 400, 500, 600, 700, 800, 900, 1000,
+    1500, 2000, 2500, 3000
+]
+
+
+# ============================================================
+# DINO ENVIRONMENT
+# ============================================================
+
+class DinoGame(Env):
+    def __init__(self):
+        super().__init__()
+
+        self.keyboard = Controller()
+
+        self.observation_space = Box(
+            low=0,
+            high=255,
+            shape=INPUT_SHAPE,
+            dtype=np.uint8
+        )
+        self.action_space = Discrete(ACTION_SIZE)
+
+        self.capture = mss.MSS()
+
+        self.game_loc = {
+            "top": 350,
+            "left": 0,
+            "width": 600,
+            "height": 360,
+        }
+
+        self.done_loc = {
+            "top": 410,
+            "left": 500,
+            "width": 475,
+            "height": 65,
+        }
+
+        self.frame_stack = deque(maxlen=4)
+        self.stacked_frames = np.zeros(
+            INPUT_SHAPE,
+            dtype=np.uint8
+        )
+
+        self.steps_survived = 0
+        self.last_milestone = 0
+        
+        self.current_score = 0
+
+    def _preprocess_frame(self, img):
+        gray = cv2.cvtColor(
+            img,
+            cv2.COLOR_BGRA2GRAY
+        )
+
+        return cv2.resize(
+            gray,
+            (100, 60),
+            interpolation=cv2.INTER_AREA
+        )
+
+    def _capture_frame(self):
+        cap = np.array(
+            self.capture.grab(self.game_loc)
+        )[:, :, :4]
+
+        return self._preprocess_frame(cap)
+
+    def _get_observation(self):
+        return self.stacked_frames.copy()
+
+    def step(self, action):
+
+        
+        # Always start from a known keyboard state.
+        self.keyboard.release(Key.up)
+        self.keyboard.release(Key.down)
+
+        # 0 = JUMP
+        # 1 = DUCK
+        # 2 = NOTHING
+
+        if action == 0:
+            self.keyboard.press(Key.up)
+
+        elif action == 1:
+            # Hold DUCK for the complete timestep.
+            self.keyboard.press(Key.down)
+
+        time.sleep(STEP_TIME)
+
+        # Capture while the action is active.
+        frame = self._capture_frame()
+
+        # Release controls after capture.
+        if action == 0:
+            self.keyboard.release(Key.up)
+
+        elif action == 1:
+            self.keyboard.release(Key.down)
+
+        self.frame_stack.append(frame)
+
+        while len(self.frame_stack) < 4:
+            self.frame_stack.append(frame)
+
+        self.stacked_frames = np.array(
+            self.frame_stack,
+            dtype=np.uint8
+        )
+
+        self.steps_survived += 1
+        #print ('steps_survived: ', self.steps_survived)
+
+        done = self.game_over()
+
+        # Clean reward:
+        # survival is good, death is bad.
+        # There is NO penalty for choosing jump or duck.
+        reward = SURVIVAL_REWARD
+
+        for milestone in MILESTONES:
+            if (
+                self.steps_survived >= milestone
+                and self.last_milestone < milestone
+            ):
+                reward += milestone / 10.0
+                self.last_milestone = milestone
+
+        if done:
+            reward += DEATH_PENALTY
+
+        return (
+            self._get_observation(),
+            reward,
+            done,
+            False,
+            {}
+        )
+
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+    
+        self.keyboard.release(Key.up)
+        self.keyboard.release(Key.down)
+    
+        # Make absolutely sure Chrome has focus.
+        self.focus_chrome()
+    
+        time.sleep(0.5)
+    
+        # Press UP to restart Dino.
+        self.keyboard.press(Key.up)
+        time.sleep(0.15)
+        self.keyboard.release(Key.up)
+    
+        # Give Chrome/Dino time to react.
+        time.sleep(0.3)
+    
+        # Wait for the game-over screen to disappear.
+        start = time.time()
+        restart_start = time.time()
+        while self.game_over():
+            self.keyboard.press(Key.up)
+            time.sleep(0.12)
+            self.keyboard.release(Key.up)
+           
+            time.sleep(0.25)
+           
+            if time.time() - restart_start > 10.0:
+                raise RuntimeError(
+                    "Chrome Dino failed to restart after 10 seconds")
+    
+        self.steps_survived = 0
+        self.last_milestone = 0
+        self.frame_stack.clear()
+    
+        # Capture fresh initial frames.
+        for _ in range(4):
+            frame = self._capture_frame()
+            self.frame_stack.append(frame)
+            time.sleep(0.02)
+    
+        self.stacked_frames = np.array(
+            self.frame_stack,
+            dtype=np.uint8
+        )
+    
+        return self._get_observation(), {}
+
+    def game_over(self):
+        finished_capture = np.array(
+            self.capture.grab(self.done_loc)
+        )[:, :, :4]
+
+        gray = cv2.cvtColor(
+            finished_capture,
+            cv2.COLOR_BGRA2GRAY
+        )
+        
+        std = np.std(gray)
+        if std > 25:
+          print(f"GAME OVER: std={std:.2f}")
+
+        return np.std(gray) > 25
+
+    def focus_chrome(self):
+        try:
+            import subprocess
+
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "Google Chrome" to activate'
+                ],
+                check=True,
+                capture_output=True
+            )
+
+            time.sleep(0.25)
+            return True
+
+        except Exception:
+            return False
+
+    def close(self):
+        self.keyboard.release(Key.up)
+        self.keyboard.release(Key.down)
+        self.capture.close()
+
+
+# ============================================================
+# DUELING DQN NETWORK
+# ============================================================
+
+class DQNNetwork(nn.Module):
+    def __init__(
+        self,
+        input_shape=INPUT_SHAPE,
+        action_size=ACTION_SIZE
+    ):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(
+            4, 32,
+            kernel_size=8,
+            stride=4
+        )
+
+        self.conv2 = nn.Conv2d(
+            32, 64,
+            kernel_size=4,
+            stride=2
+        )
+
+        self.conv3 = nn.Conv2d(
+            64, 64,
+            kernel_size=3,
+            stride=1
+        )
+
+        # 60x100:
+        # -> 14x24
+        # -> 6x11
+        # -> 4x9
+        conv_size = 64 * 4 * 9
+
+        self.fc = nn.Linear(
+            conv_size,
+            512
+        )
+
+        # Dueling value stream.
+        self.value = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+        # Dueling advantage stream.
+        self.advantage = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, action_size)
+        )
+
+    def forward(self, x):
+        # Normalize here so ALL callers use identical scaling.
+        x = x.float() / 255.0
+
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+
+        x = x.flatten(1)
+        x = F.relu(self.fc(x))
+
+        value = self.value(x)
+        advantage = self.advantage(x)
+
+        # Q(s,a) = V(s) + A(s,a) - mean(A)
+        return value + (
+            advantage -
+            advantage.mean(
+                dim=1,
+                keepdim=True
+            )
+        )
+
+
+# ============================================================
+# REPLAY BUFFER
+# ============================================================
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(
+            maxlen=capacity
+        )
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def add(
+        self,
+        state,
+        action,
+        reward,
+        next_state,
+        done
+    ):
+        self.buffer.append(
+            (
+                np.array(
+                    state,
+                    copy=True
+                ),
+                int(action),
+                float(reward),
+                np.array(
+                    next_state,
+                    copy=True
+                ),
+                bool(done),
+            )
+        )
+
+    def sample(self, batch_size):
+        return random.sample(
+            self.buffer,
+            batch_size
+        )
+
+    def save(self, filename):
+        with open(
+            filename,
+            "wb"
+        ) as f:
+            pickle.dump(
+                self.buffer,
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL
+            )
+
+    def load(self, filename):
+        with open(
+            filename,
+            "rb"
+        ) as f:
+            data = pickle.load(f)
+
+        self.buffer = deque(
+            data,
+            maxlen=self.buffer.maxlen
+        )
+
+
+# ============================================================
+# DQN AGENT
+# ============================================================
+
+class DQNAgent:
+    def __init__(self):
+        self.action_size = ACTION_SIZE
+
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+
+        print(
+            f"Using device: {self.device}"
+        )
+
+        self.policy_net = DQNNetwork().to(
+            self.device
+        )
+
+        self.target_net = DQNNetwork().to(
+            self.device
+        )
+
+        self.target_net.load_state_dict(
+            self.policy_net.state_dict()
+        )
+
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(
+            self.policy_net.parameters(),
+            lr=LEARNING_RATE
+        )
+
+        self.memory = ReplayBuffer(
+            REPLAY_MEMORY_SIZE
+        )
+
+        self.training_steps = 0
+
+        self.epsilon = EPSILON_START
+
+    # --------------------------------------------------------
+    # EPSILON
+    # --------------------------------------------------------
+
+    def update_epsilon(self):
+        progress = min(
+            self.training_steps /
+            EPSILON_DECAY_STEPS,
+            1.0
+        )
+
+        self.epsilon = (
+            EPSILON_START +
+            progress *
+            (EPSILON_MIN - EPSILON_START)
+        )
+
+    # --------------------------------------------------------
+    # ACTION
+    # --------------------------------------------------------
+    def act(self, state, training=True, step_in_episode=None):
+    
+        exploring_allowed = (
+            step_in_episode is None
+            or step_in_episode >= EXPLORATION_GRACE_STEPS
+        )
+    
+        if training and exploring_allowed and random.random() < self.epsilon:
+            return random.randrange(self.action_size)
+    
+        state_tensor = torch.from_numpy(
+            np.asarray(
+                state,
+                dtype=np.float32
+            )
+        ).unsqueeze(0).to(self.device)
+    
+        with torch.no_grad():
+            q_values = self.policy_net(state_tensor)
+    
+        return int(
+            q_values.argmax(dim=1).item()
+    )
+
+    # --------------------------------------------------------
+    # STORE
+    # --------------------------------------------------------
+
+    def remember(
+        self,
+        state,
+        action,
+        reward,
+        next_state,
+        done
+    ):
+        self.memory.add(
+            state,
+            action,
+            reward,
+            next_state,
+            done
+        )
+
+    # --------------------------------------------------------
+    # LEARN
+    # --------------------------------------------------------
+
+    def replay(self):
+        if len(self.memory) < LEARNING_STARTS:
+            return None
+
+        batch = self.memory.sample(
+            BATCH_SIZE
+        )
+
+        states = torch.from_numpy(
+            np.stack(
+                [b[0] for b in batch]
+            ).astype(np.float32)
+        ).to(self.device)
+
+        actions = torch.tensor(
+            [b[1] for b in batch],
+            dtype=torch.long,
+            device=self.device
+        )
+
+        rewards = torch.tensor(
+            [b[2] for b in batch],
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        next_states = torch.from_numpy(
+            np.stack(
+                [b[3] for b in batch]
+            ).astype(np.float32)
+        ).to(self.device)
+
+        dones = torch.tensor(
+            [b[4] for b in batch],
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        # Current Q(s,a).
+        current_q = (
+            self.policy_net(states)
+            .gather(
+                1,
+                actions.unsqueeze(1)
+            )
+            .squeeze(1)
+        )
+
+        # Double DQN target.
+        with torch.no_grad():
+
+            # Policy chooses the next action.
+            next_actions = (
+                self.policy_net(next_states)
+                .argmax(dim=1)
+            )
+
+            # Target evaluates that action.
+            next_q = (
+                self.target_net(next_states)
+                .gather(
+                    1,
+                    next_actions.unsqueeze(1)
+                )
+                .squeeze(1)
+            )
+            #Bellman equation (V = max(R9s,a) + gamma*V(s'))
+            target_q = (
+                rewards +
+                (1.0 - dones) *
+                GAMMA *
+                next_q
+            )
+        #trains the network to move current_q toward Bellman target
+        loss = F.smooth_l1_loss(
+            current_q,
+            target_q
+        )
+
+        self.optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            self.policy_net.parameters(),
+            GRAD_CLIP
+        )
+
+        self.optimizer.step()
+
+        self.training_steps += 1
+        if not getattr(self, "continuation_mode", False):
+            self.update_epsilon()
+
+        # Target update based on actual learning steps.
+        if (
+            self.training_steps %
+            TARGET_UPDATE_STEPS == 0
+        ):
+            self.target_net.load_state_dict(
+                self.policy_net.state_dict()
+            )
+
+        return float(
+            loss.item()
+        )
+
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
+    def save(
+        self,
+        filename,
+        episode,
+        best_eval
+    ):
+        checkpoint = {
+            "policy_net":
+                self.policy_net.state_dict(),
+
+            "target_net":
+                self.target_net.state_dict(),
+
+            "optimizer":
+                self.optimizer.state_dict(),
+
+            "epsilon":
+                self.epsilon,
+
+            "episode":
+                episode,
+
+            "training_steps":
+                self.training_steps,
+
+            "best_eval":
+                best_eval,
+        }
+
+        torch.save(
+            checkpoint,
+            filename
+        )
+
+    def save_memory(self, filename):
+        self.memory.save(
+            filename
+        )
+
+    # --------------------------------------------------------
+    # LOAD
+    # --------------------------------------------------------
+
+    def load(
+        self,
+        filename,
+        load_memory=True
+    ):
+        print(
+            f"\n📂 Loading {filename}"
+        )
+
+        checkpoint = torch.load(
+            filename,
+            map_location=self.device,
+            weights_only=False
+        )
+
+        self.policy_net.load_state_dict(
+            checkpoint["policy_net"]
+        )
+
+        self.target_net.load_state_dict(
+            checkpoint["target_net"]
+        )
+
+        self.optimizer.load_state_dict(
+            checkpoint["optimizer"]
+        )
+
+        self.epsilon = checkpoint.get(
+            "epsilon",
+            EPSILON_START
+        )
+
+        self.training_steps = checkpoint.get(
+            "training_steps",
+            0
+        )
+
+        episode = checkpoint.get(
+            "episode",
+            0
+        )
+
+        best_eval = checkpoint.get(
+            "best_eval",
+            -float("inf")
+        )
+
+        memory_file = (
+            filename +
+            ".memory.pkl"
+        )
+
+        if (
+            load_memory and
+            os.path.exists(memory_file)
+        ):
+            self.memory.load(
+                memory_file
+            )
+
+            print(
+                f"   Replay memory: "
+                f"{len(self.memory):,}"
+            )
+        else:
+            print(
+                "   Replay memory not loaded"
+            )
+
+        print(
+            f"   Episodes: {episode}"
+        )
+
+        print(
+            f"   Training steps: "
+            f"{self.training_steps:,}"
+        )
+
+        print(
+            f"   Epsilon: "
+            f"{self.epsilon:.4f}"
+        )
+
+        print(
+            f"   Best eval: "
+            f"{best_eval:.1f}"
+        )
+
+        return (
+            episode,
+            best_eval
+        )
+
+
+# ============================================================
+# SAVE COMPLETE TRAINING STATE
+# ============================================================
+
+def save_agent(
+    agent,
+    filename,
+    episode,
+    best_eval
+):
+    agent.save(
+        filename,
+        episode,
+        best_eval
+    )
+
+    agent.save_memory(
+        filename +
+        ".memory.pkl"
+    )
+
+
+# ============================================================
+# DETERMINISTIC EVALUATION
+# ============================================================
+
+def evaluate(
+    agent,
+    games=10,
+    verbose=True
+):
+    env = DinoGame()
+
+    old_epsilon = agent.epsilon
+    agent.epsilon = 0.0
+
+    scores = []
+
+    try:
+        for game in range(
+            1,
+            games + 1
+        ):
+            state, _ = env.reset()
+            agent.current_score = 0
+            total_reward = 0.0
+            steps = 0
+
+            while True:
+                action = agent.act(
+                    state,
+                    training=False
+                )
+
+                (
+                    next_state,
+                    reward,
+                    done,
+                    truncated,
+                    _
+                ) = env.step(action)
+
+                state = next_state
+                total_reward += reward
+                steps += 1
+
+                if (
+                    done or
+                    truncated or
+                    steps >= MAX_STEPS
+                ):
+                    break
+
+            scores.append(steps)
+
+            if verbose:
+                print(
+                    f"Game {game:2d}: "
+                    f"Score={steps:5d} | "
+                    f"Reward={total_reward:8.1f}"
+                )
+
+    finally:
+        agent.epsilon = old_epsilon
+        env.close()
+
+    average = float(
+        np.mean(scores)
+    )
+
+    median = float(
+        np.median(scores)
+    )
+
+    best = int(
+        max(scores)
+    )
+
+    print(
+        "\n" + "-" * 70
+    )
+
+    print(
+        f"Average score : "
+        f"{average:.1f}"
+    )
+
+    print(
+        f"Median score  : "
+        f"{median:.1f}"
+    )
+
+    print(
+        f"Best score    : "
+        f"{best}"
+    )
+
+    print(
+        "-" * 70
+    )
+
+    return average
+
+
+# ============================================================
+# TRAIN FROM SCRATCH
+# ============================================================
+
+def train_from_scratch(
+    episodes=500
+):
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "🚀 STARTING FRESH DQN TRAINING"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "\nNo old model is loaded."
+    )
+
+    print(
+        "Best model is determined by "
+        "deterministic evaluation."
+    )
+
+    env = DinoGame()
+    agent = DQNAgent()
+
+    best_eval = -float("inf")
+
+    episode_rewards = []
+
+    for episode in range(
+        1,
+        episodes + 1
+    ):
+        state, _ = env.reset()
+        agent.current_score = 0
+        total_reward = 0.0
+        steps = 0
+        losses = []
+
+        while True:
+            action = agent.act(
+                state,
+                training=True
+            )
+
+            (
+                next_state,
+                reward,
+                done,
+                truncated,
+                _
+            ) = env.step(action)
+
+            agent.remember(
+                state,
+                action,
+                reward,
+                next_state,
+                done or truncated
+            )
+
+            loss = agent.replay()
+
+            if loss is not None:
+                losses.append(loss)
+
+            state = next_state
+            total_reward += reward
+            steps += 1
+
+            if (
+                done or
+                truncated or
+                steps >= MAX_STEPS
+            ):
+                break
+
+        episode_rewards.append(
+            total_reward
+        )
+
+        avg50 = float(
+            np.mean(
+                episode_rewards[-50:]
+            )
+        )
+
+        avg_loss = (
+            float(np.mean(losses))
+            if losses
+            else 0.0
+        )
+
+        print(
+            f"Episode {episode:4d}/{episodes} | "
+            f"Steps {steps:4d} | "
+            f"Reward {total_reward:8.1f} | "
+            f"Avg50 {avg50:8.1f} | "
+            f"Loss {avg_loss:.5f} | "
+            f"Epsilon {agent.epsilon:.4f}"
+        )
+
+        # Latest always follows the current policy.
+        save_agent(
+            agent,
+            LATEST_MODEL,
+            episode,
+            best_eval
+        )
+
+        # Evaluate periodically.
+        if (
+            episode % EVALUATION_EVERY_EPISODES == 0
+            or episode == episodes
+        ):
+            print(
+                "\n🔎 Running deterministic evaluation..."
+            )
+
+            eval_score = evaluate(
+                agent,
+                games=EVALUATION_GAMES
+            )
+
+            if eval_score > best_eval:
+                best_eval = eval_score
+
+                save_agent(
+                    agent,
+                    BEST_MODEL,
+                    episode,
+                    best_eval
+                )
+
+                print(
+                    f"\n🏆 NEW BEST EVALUATION: "
+                    f"{best_eval:.1f}"
+                )
+
+            else:
+                print(
+                    f"No evaluation improvement. "
+                    f"Best: {best_eval:.1f}"
+                )
+
+    env.close()
+
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "✅ TRAINING COMPLETE"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"Best evaluation average: "
+        f"{best_eval:.1f}"
+    )
+
+    print(
+        f"Latest model: {LATEST_MODEL}"
+    )
+
+    print(
+        f"Best model:   {BEST_MODEL}"
+    )
+
+    return agent
+
+
+# ============================================================
+# CONTINUE TRAINING
+# ============================================================
+
+def continue_training(
+    additional_episodes=500,
+    model_file=BEST_MODEL
+):
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "🔄 CONTINUING DQN TRAINING"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    env = DinoGame()
+    agent = DQNAgent()
+
+    if not os.path.exists(
+        model_file
+    ):
+        print(
+            f"❌ Model not found: "
+            f"{model_file}"
+        )
+
+        env.close()
+        return None
+
+    (
+        previous_episode,
+        best_eval
+    ) = agent.load(
+        model_file,
+        load_memory=True
+    )
+    best_eval = 241.3  # override stale metadata with the real measured baseline for this checkpoint
+    # Override saved epsilon for continuation training
+    agent.epsilon = EPSILON_CONTINUE
+    agent.continuation_mode = True
+    print(
+        f"🔄 Continuation exploration reset to "
+        f"epsilon={agent.epsilon:.4f}"
+    )
+
+    print(
+        f"\n▶️ Resuming from episode "
+        f"{previous_episode}"
+    )
+
+    print(
+        f"▶️ Additional episodes: "
+        f"{additional_episodes}"
+    )
+
+    episode_rewards = []
+
+    for local_episode in range(
+        1,
+        additional_episodes + 1
+    ):
+        global_episode = (
+            previous_episode +
+            local_episode
+        )
+
+        state, _ = env.reset()
+        agent.current_score = 0
+        total_reward = 0.0
+        steps = 0
+        losses = []
+
+        while True:
+            agent.current_score = steps
+            action = agent.act(
+                state,
+                training=True,
+                step_in_episode=steps
+            )
+
+            (
+                next_state,
+                reward,
+                done,
+                truncated,
+                _
+            ) = env.step(action)
+
+            agent.remember(
+                state,
+                action,
+                reward,
+                next_state,
+                done or truncated
+            )
+
+            #UPDATE_EVERY = 4  # only gradient-step every 4th environment step
+            
+            loss = None
+            if agent.training_steps == 0 or steps % UPDATE_EVERY == 0:
+                loss = agent.replay()
+            
+            if loss is not None:
+                losses.append(loss)
+
+            state = next_state
+            total_reward += reward
+            steps += 1
+
+            if (
+                done or
+                truncated or
+                steps >= MAX_STEPS
+            ):
+                break
+
+        episode_rewards.append(
+            total_reward
+        )
+
+        avg50 = float(
+            np.mean(
+                episode_rewards[-50:]
+            )
+        )
+
+        avg_loss = (
+            float(np.mean(losses))
+            if losses
+            else 0.0
+        )
+
+        print(
+            f"Episode {global_episode:5d} | "
+            f"Steps {steps:4d} | "
+            f"Reward {total_reward:8.1f} | "
+            f"Avg50 {avg50:8.1f} | "
+            f"Loss {avg_loss:.5f} | "
+            f"Epsilon {agent.epsilon:.4f}"
+        )
+
+        save_agent(
+            agent,
+            LATEST_MODEL,
+            global_episode,
+            best_eval
+        )
+
+        if (
+            local_episode %
+            EVALUATION_EVERY_EPISODES == 0
+            or local_episode == additional_episodes
+        ):
+            print(
+                "\n🔎 Running deterministic evaluation..."
+            )
+
+            eval_score = evaluate(
+                agent,
+                games=EVALUATION_GAMES
+            )
+
+            if eval_score > best_eval:
+                best_eval = eval_score
+
+                save_agent(
+                    agent,
+                    BEST_MODEL,
+                    global_episode,
+                    best_eval
+                )
+
+                print(
+                    f"\n🏆 NEW BEST EVALUATION: "
+                    f"{best_eval:.1f}"
+                )
+
+            else:
+                print(
+                    f"No evaluation improvement. "
+                    f"Best: {best_eval:.1f}"
+                )
+
+    env.close()
+
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "✅ CONTINUED TRAINING COMPLETE"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"Previous episode: "
+        f"{previous_episode}"
+    )
+
+    print(
+        f"Current episode: "
+        f"{previous_episode + additional_episodes}"
+    )
+
+    print(
+        f"Best evaluation average: "
+        f"{best_eval:.1f}"
+    )
+
+    print(
+        f"Epsilon: {agent.epsilon:.4f}"
+    )
+
+    return agent
+
+
+# ============================================================
+# PLAY / EVALUATE
+# ============================================================
+
+def play_dqn(
+    model_file=BEST_MODEL,
+    games=20
+):
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        f"🎮 EVALUATING {model_file}"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    env = DinoGame()
+    agent = DQNAgent()
+
+    if not os.path.exists(
+        model_file
+    ):
+        print(
+            f"❌ Model not found: "
+            f"{model_file}"
+        )
+
+        env.close()
+        return None
+
+    agent.load(
+        model_file,
+        load_memory=False
+    )
+
+    return evaluate(
+        agent,
+        games=games
+    )
+
+
+# ============================================================
+# FIND BEST CHECKPOINT
+# ============================================================
+
+def find_best_model():
+    files = []
+
+    for filename in glob.glob(
+        "*.pth"
+    ):
+        if (
+            filename.startswith(
+                "checkpoint_ep"
+            )
+            or filename in {
+                BEST_MODEL,
+                LATEST_MODEL
+            }
+        ):
+            files.append(filename)
+
+    files = sorted(
+        set(files)
+    )
+
+    if not files:
+        print(
+            "❌ No model files found."
+        )
+        return None
+
+    print(
+        f"Found {len(files)} model files."
+    )
+
+    results = {}
+
+    for filename in files:
+        print(
+            "\n" + "=" * 70
+        )
+
+        print(
+            f"Testing {filename}"
+        )
+
+        print(
+            "=" * 70
+        )
+
+        try:
+            results[filename] = play_dqn(
+                filename,
+                games=10
+            )
+
+        except Exception as exc:
+            print(
+                f"❌ Failed: {exc}"
+            )
+
+    if not results:
+        return None
+
+    best = max(
+        results,
+        key=results.get
+    )
+
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "🏆 BEST CHECKPOINT"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"Model: {best}"
+    )
+
+    print(
+        f"Average score: "
+        f"{results[best]:.1f}"
+    )
+
+    return best
+
+
+# ============================================================
+# DEBUG IMAGE INPUT
+# ============================================================
+
+def visualize_game_state():
+    env = DinoGame()
+
+    try:
+        env.reset()
+        time.sleep(0.5)
+
+        raw = np.array(
+            env.capture.grab(
+                env.game_loc
+            )
+        )[:, :, :4]
+
+        processed = env._preprocess_frame(
+            raw
+        )
+
+        stacked = env._get_observation()
+
+        fig, axes = plt.subplots(
+            2,
+            3,
+            figsize=(15, 8)
+        )
+
+        axes[0, 0].imshow(raw)
+        axes[0, 0].set_title("Raw")
+        axes[0, 0].axis("off")
+
+        axes[0, 1].imshow(
+            processed,
+            cmap="gray"
+        )
+        axes[0, 1].set_title(
+            "Preprocessed 60x100"
+        )
+        axes[0, 1].axis("off")
+
+        for i in range(4):
+            ax = axes.flat[i + 2]
+
+            ax.imshow(
+                stacked[i],
+                cmap="gray"
+            )
+
+            ax.set_title(
+                f"Frame {i + 1}"
+            )
+
+            ax.axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
+        print("\nImage information:")
+        print(
+            "Raw:",
+            raw.shape
+        )
+        print(
+            "Processed:",
+            processed.shape
+        )
+        print(
+            "Stacked:",
+            stacked.shape
+        )
+        print(
+            "Pixel range:",
+            processed.min(),
+            "-",
+            processed.max()
+        )
+
+    finally:
+        env.close()
+
+
+# ============================================================
+# MENU
+# ============================================================
+
+def main():
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "🦖 CHROME DINO — DQN"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "\n1. Start NEW training"
+    )
+
+    print(
+        "2. Continue training latest model"
+    )
+
+    print(
+        "3. Evaluate BEST model"
+    )
+
+    print(
+        "4. Evaluate LATEST model"
+    )
+
+    print(
+        "5. Find best checkpoint"
+    )
+
+    print(
+        "6. Debug game state"
+    )
+
+    print(
+        "7. Exit"
+    )
+
+    choice = input(
+        "\nChoose option (1-7): "
+    ).strip()
+
+    if choice == "1":
+        value = input(
+            "Number of episodes "
+            "(default 500): "
+        ).strip()
+
+        episodes = (
+            int(value)
+            if value
+            else 500
+        )
+
+        train_from_scratch(
+            episodes
+        )
+
+    elif choice == "2":
+        value = input(
+            "Additional episodes "
+            "(default 500): "
+        ).strip()
+
+        episodes = (
+            int(value)
+            if value
+            else 500
+        )
+
+        continue_training(
+            additional_episodes=episodes,
+            model_file=LATEST_MODEL
+        )
+
+    elif choice == "3":
+        value = input(
+            "Number of games "
+            "(default 20): "
+        ).strip()
+
+        games = (
+            int(value)
+            if value
+            else 20
+        )
+
+        play_dqn(
+            BEST_MODEL,
+            games
+        )
+
+    elif choice == "4":
+        value = input(
+            "Number of games "
+            "(default 20): "
+        ).strip()
+
+        games = (
+            int(value)
+            if value
+            else 20
+        )
+
+        play_dqn(
+            LATEST_MODEL,
+            games
+        )
+
+    elif choice == "5":
+        find_best_model()
+
+    elif choice == "6":
+        visualize_game_state()
+
+    elif choice == "7":
+        print(
+            "Goodbye!"
+        )
+
+    else:
+        print(
+            "❌ Invalid choice."
+        )
+
+
+if __name__ == "__main__":
+    main()
