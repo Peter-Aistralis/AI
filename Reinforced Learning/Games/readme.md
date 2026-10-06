@@ -1,6 +1,6 @@
-** Dino **
+# Dino 
 
-** Snake **
+# Snake 
 original version was stuck at eating 3-4 apples, even after 7000 training episodes
 this version is an updated version of v.1.
 Improvements are:
