@@ -23,7 +23,7 @@ ACTION_SIZE = 3
 N_STEP = 3
 
 PER_ALPHA = 0.6    # how much prioritization (0 = uniform, 1 = full)
-PER_BETA  = 0.4    # importance sampling correction (0 = none, 1 = full)
+PER_BETA  = 0.2   # importance sampling correction (0 = none, 1 = full)
 PER_EPS   = 1e-6   # small constant so priorities never hit zero
 
 LEARNING_RATE = 1e-4
@@ -333,7 +333,7 @@ class Snake(Env):
     if terminated:
       self.active_apple = None
       self.last_head_pos = None
-      return stacked_obs, -5.0, True, False, {}
+      return stacked_obs, -3.0, True, False, {}
 
     reward = 0.0
     curr_head = self.find_snake_head(raw_frame)
@@ -519,10 +519,13 @@ class DQNAgent:
     self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LEARNING_RATE)
     self.memory = ReplayBuffer(REPLAY_MEMORY_SIZE)
     self.epsilon = EPSILON_START
+    
+    self.post_apple_explore = False
+    
     self.training_steps = 0
     self.best_eval_apples = -1.0
     self.best_recent_avg = -float("inf")
-
+  '''
   def act(self, state):
     if random.random() < self.epsilon:
       return random.randrange(self.action_size)
@@ -532,6 +535,31 @@ class DQNAgent:
     )
     with torch.no_grad():
       q_values = self.policy_net(state_t)
+    if self.epsilon == 0.0:
+        q = q_va lues.cpu().numpy()[0]
+        print(f"    Q: L={q[0]:+.2f} S={q[1]:+.2f} R={q[2]:+.2f} → action {q.argmax()}")
+    return q_values.argmax(dim=1).item()
+'''
+
+  def act(self, state):
+    # Determine effective epsilon for this action
+    if self.epsilon == 0.0:
+        # Eval mode — always greedy, no boost
+        eps = 0.0
+    elif self.post_apple_explore:
+        # After apple #1 — boost exploration to discover apple #2
+        eps = max(self.epsilon, 0.15)
+    else:
+        eps = self.epsilon
+
+    if random.random() < eps:
+        return random.randrange(self.action_size)
+
+    state_t = (
+        torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+    )
+    with torch.no_grad():
+        q_values = self.policy_net(state_t)
     if self.epsilon == 0.0:
         q = q_values.cpu().numpy()[0]
         print(f"    Q: L={q[0]:+.2f} S={q[1]:+.2f} R={q[2]:+.2f} → action {q.argmax()}")
@@ -811,6 +839,7 @@ if __name__ == "__main__":
     done = False
 
     while not done:
+      agent.post_apple_explore = (env.apples_eaten >= 1)
       action = agent.act(state)
       next_state, reward, terminated, truncated, _ = env.step(action)
       done = terminated or truncated
