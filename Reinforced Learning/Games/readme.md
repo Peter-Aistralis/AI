@@ -14,7 +14,8 @@ I wanted only to rely on pure vision, so only on computers / robots see. So, no 
 
 this version is an updated version of v.1.
 Improvements are:
-- added a 5th channel for snake-body detection
+- added a 5th channel for snake-body detection (body, walls, head, apple and game-board have their different channel).
+  Because this is a a static representation, it has no idea of spacial constraints. By doubling the stack, it knows what direction it is going.
 - implemented 'Multi-Steps-Return'
 - implemented 'Prioritzed Experience Replay (PER)'
-- implemented a 'boost' function -> gives snake an incentive to go find the next apple, so explore more. By this it knows there is a next one
+- changed calculation of 'Epsilon decay', it looked correct but it was calculated once per every step.
